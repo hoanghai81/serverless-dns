@@ -11,6 +11,7 @@
 // stackoverflow.com/a/47332317
 import { kdfSvcSecretHex } from "../commons/envutil.js";
 import { log } from "../core/log.js";
+import * as bufutil from "./bufutil.js";
 import { emptyBuf, fromStr, hex2buf, normalize8 } from "./bufutil.js";
 import { emptyString } from "./util.js";
 
@@ -25,15 +26,25 @@ const fixedsalt = new Uint8Array([
 const encctx = fromStr("encryptcrossservice");
 const macctx = fromStr("authorizecrossservice");
 
+/**
+ * Generate 48-byte ticket from seed and context.
+ * @param {Uint8Array} seed
+ * @param {string} ctx
+ * @returns {Promise<Uint8Array>}
+ */
 export async function tkt48(seed, ctx) {
   if (!emptyBuf(seed) && !emptyString(ctx)) {
     try {
-      const sk256 = seed.slice(0, hkdfalgkeysz);
+      const sk512 = await sha512(seed);
       const info512 = await sha512(fromStr(ctx));
-      const dk512 = await gen(sk256, info512);
+      const dk512 = await gen(sk512, info512);
+      log.i("tkt48: new", bufutil.len(seed), bufutil.len(dk512), ctx);
       return new Uint8Array(dk512.slice(0, tktsz));
-    } catch (ignore) {}
+    } catch (ignore) {
+      log.e("tkt48: err", bufutil.len(seed), ctx, ignore);
+    }
   }
+  log.i("tkt48: random");
   const t = new Uint8Array(tktsz);
   crypto.getRandomValues(t);
   return t;
@@ -87,17 +98,37 @@ export async function hkdfaes(skmac, usectx, salt = new Uint8Array(0)) {
 }
 
 /**
+ * Generate raw derived bits using HKDF.
  * @param {BufferSource} sk
  * @param {BufferSource} usectx
  * @param {BufferSource} salt
  * @returns {Promise<ArrayBuffer>}
  */
-export async function hkdfraw(sk, usectx, salt = new Uint8Array(0)) {
+export async function hkdfraw(
+  sk,
+  usectx,
+  salt = new Uint8Array(0),
+  bits = 512
+) {
   const dk = await hkdf(sk);
   return crypto.subtle.deriveBits(
     hkdf256(salt, usectx),
     dk,
-    hkdfalgkeysz * 8 // length in bits (256 bits)
+    bits // length in bits (512 bits)
+  );
+}
+/**
+ * Generate HMAC-SHA256 key from raw secret key.
+ * @param {BufferSource} sk
+ * @returns {Promise<CryptoKey>}
+ */
+export async function hmackey(sk) {
+  return crypto.subtle.importKey(
+    "raw",
+    sk,
+    hmac256opts(),
+    false, // export = false
+    ["sign", "verify"]
   );
 }
 
@@ -111,16 +142,33 @@ async function hkdf(sk) {
   );
 }
 
-function hmac256opts() {
-  return { name: "HMAC", hash: "SHA-256" }; // length: 512 (bits) default
+/**
+ *
+ * @param {int} len
+ * @returns {HmacKeyGenParams}
+ */
+function hmac256opts(len = 512) {
+  // length: 512 (bits) default for HMAC-SHA-256
+  return { name: "HMAC", hash: "SHA-256", length: len };
 }
 
+/**
+ *
+ * @param {BufferSource} salt
+ * @param {BufferSource} usectx
+ * @returns {HkdfParams}
+ */
 function hkdf256(salt, usectx) {
   return { name: "HKDF", hash: "SHA-256", salt: salt, info: usectx };
 }
 
 export async function sha512(buf) {
   const ab = await crypto.subtle.digest("SHA-512", buf);
+  return normalize8(ab);
+}
+
+export async function sha256(buf) {
+  const ab = await crypto.subtle.digest("SHA-256", buf);
   return normalize8(ab);
 }
 
@@ -191,13 +239,15 @@ export async function decryptAesGcm(aeskey, iv, taggedciphertext, aad) {
 }
 
 /**
+ * hmac sign & verify: stackoverflow.com/a/72765383
  * @param {CryptoKey} ck - The HMAC key
  * @param {BufferSource} m - message to sign
- * @returns {Promise<ArrayBuffer>} - The HMAC signature
+ * @returns {Promise<Uint8Array>} - The HMAC signature
  * @throws {Error} - If the key is not valid or signing fails
  */
 export function hmacsign(ck, m) {
-  return crypto.subtle.sign("HMAC", ck, m);
+  const ab = crypto.subtle.sign("HMAC", ck, m);
+  return normalize8(ab);
 }
 
 /**
@@ -212,10 +262,10 @@ export function hmacverify(ck, mac, m) {
 }
 
 /**
- * @returns {Promise<[CryptoKey?, CryptoKey?, ArrayBuffer?]>} - aeskey, mackey, pskkey
+ * @returns {Promise<[CryptoKey?, CryptoKey?]>} - aeskey, mackey
  */
 export async function svckeys() {
-  const nokeys = [null, null, null];
+  const nokeys = [null, null];
   if (emptyBuf(encctx) || emptyBuf(macctx)) {
     log.e("key: ctx missing");
     return nokeys;
@@ -245,7 +295,6 @@ export async function svckeys() {
     const info512mac = await sha512(macctx);
     // exportable: crypto.subtle.exportKey("raw", key);
     // log.d("key fingerprint", bufutil.hex(await sha512(bufutil.concat(sk, info512)));
-
     const aeskey = await hkdfaes(sk256, info512enc);
     const mackey = await hkdfhmac(sk256, info512mac);
 
@@ -253,5 +302,5 @@ export async function svckeys() {
   } catch (ignore) {
     log.d("keygen: err", ignore);
   }
-  return null;
+  return nokeys;
 }

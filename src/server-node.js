@@ -309,21 +309,6 @@ function systemUp() {
   const supportsHttp2 = envutil.isNode() || envutil.isDeno();
   const isBun = envutil.isBun();
   const allowTlsPsk = envutil.allowTlsPsk();
-  let tlsPsk = null;
-  if (allowTlsPsk) {
-    const pskhex = envutil.tlsPskHex();
-    if (pskhex == null) {
-      log.w(
-        "TLS_PSK not set; using per-process session random",
-        psk.staticPskCred.idhexhint,
-        bufutil.len(psk.staticPskCred.key),
-        "bytes"
-      );
-    } else {
-      tlsPsk = bufutil.hex2buf(pskhex);
-      log.i("TLS PSK configured", bufutil.len(tlsPsk), "bytes");
-    }
-  }
 
   if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
@@ -335,6 +320,18 @@ function systemUp() {
   } else {
     adjTimer = util.repeat(adjPeriodSec * 1000, adjustMaxConns);
     log.i(`cpu ${cpucount}, ip ${zero6}, tcpb ${tcpbacklog}, c ${maxconns}`);
+  }
+
+  /** @type {Uint8Array?} */
+  let tlsPsk = null;
+  if (allowTlsPsk) {
+    const pskhex = envutil.tlsPskHex();
+    tlsPsk = bufutil.hex2buf(pskhex);
+    if (bufutil.len(tlsPsk) < psk.minkeyentropy) {
+      log.e("TLS_PSK disabled; seed not", psk.minkeyentropy, "bytes long");
+      allowTlsPsk = false;
+      if (envManager != null) envManager.set("TLS_PSK", ""); // disable
+    }
   }
 
   // nodejs.org/api/net.html#netcreateserveroptions-connectionlistener
@@ -384,30 +381,16 @@ function systemUp() {
     tlsOpts.pskCallback = (_socket, idhex) => {
       stats.tottlspsk += 1;
       if (!bufutil.isHex(idhex)) return;
-      if (psk.staticPskCred == null) {
-        stats.tlspskmiss += 1;
-        return null; // unlikely
-      }
 
-      // const idhexhint = psk.staticPskCred.idhexhint;
       // openssl s_client -reconnect -tls1_2 -psk_identity 790bb45383670663ce9a39480be2de5426179506c8a6b2be922af055896438dd06dd320e68cd81348a32d679c026f73be64fdbbc46c43bfbc0f98160ffae2452
       // -psk "$TLS_PSK" -connect dns.rethinkdns.localhost:10000 -debug -cipher "PSK-AES128-GCM-SHA256"
-      // TODO: confirm key is compatible with socket.getCipher();
-      if (idhex === psk.staticPskCred.idhex) {
-        stats.tlspsks += 1;
-        const customPsk = bufutil.len(tlsPsk) >= psk.keysize;
-        // log.d("TLS PSK: static id", idhexhint, "custom key?", customPsk);
-        if (customPsk) {
-          return tlsPsk;
-        }
-        return psk.staticPskCred.key;
-      }
-
       /** @type {psk.PskCred?} */
       const creds = psk.recentPskCreds.get(idhex);
       if (creds && creds.ok()) {
-        stats.tlspskd += 1;
         // log.d("TLS PSK: known client", creds.idhexhint);
+        if (idhex === creds.idhex) stats.tlspsks += 1;
+        else stats.tlspskd += 1;
+        // TODO: confirm creds.key is compatible with socket.getCipher();
         return creds.key;
       }
 
@@ -420,8 +403,7 @@ function systemUp() {
       stats.tlspskmiss += 1;
       return null;
     };
-    tlsOpts.pskIdentityHint =
-      psk.staticPskCred == null ? psk.serverid : psk.staticPskCred.idhexhint;
+    tlsOpts.pskIdentityHint = psk.serverid;
     log.i("TLS PSK identity hint", tlsOpts.pskIdentityHint);
   }
   // nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
@@ -463,8 +445,8 @@ function systemUp() {
     // terminate tls ourselves
     /** @type {tls.TlsOptions} */
     const secOpts = {
-      key: envutil.tlsKey(),
-      cert: envutil.tlsCrt(),
+      key: bufutil.fromB64(envutil.tlsKey()),
+      cert: bufutil.fromB64(envutil.tlsCrt()),
       ...tlsOpts,
       ...serverOpts,
     };
@@ -546,20 +528,26 @@ async function certUpdateForever(secopts, s, n = 0) {
   if (!crt) return false;
   else logCertInfo(crt);
 
-  const fourHoursMs = 4 * 60 * 60 * 1000; // in ms
+  const oneDayMs = 24 * 60 * 60 * 1000; // in ms
   const validUntil = new Date(crt.validTo).getTime() - Date.now();
-  if (validUntil > fourHoursMs) {
+  if (validUntil > oneDayMs) {
     console.log("crt: #", n, "update: valid for", validUntil, "ms; not needed");
-    util.timeout(validUntil - fourHoursMs, () => certUpdateForever(secopts, s));
+    util.timeout(validUntil - oneDayMs, () => certUpdateForever(secopts, s));
     return false;
   }
 
-  const oneMinMs = 60 * 1000; // in ms
+  const oneMinMs = 1 * 60 * 1000; // in ms
+  const sixMinMs = 6 * 60 * 1000; // in ms
   const [latestKey, latestCert] = await nodeutil.replaceKeyCert(crt);
   if (bufutil.emptyBuf(latestKey) || bufutil.emptyBuf(latestCert)) {
-    console.error("crt: #", n, "update: no key/cert fetched");
     n = n + 1;
-    util.timeout(oneMinMs * n, () => certUpdateForever(secopts, s, n));
+    const attemptsLeft = Math.max(1, maxCertUpdateAttempts - n);
+    let when = validUntil <= oneMinMs ? oneMinMs : sixMinMs * attemptsLeft;
+    if (validUntil > oneMinMs && when > validUntil) {
+      when = Math.max(oneMinMs, validUntil - oneMinMs);
+    }
+    console.error("crt: #", n, "update: no key/cert fetched; next", when);
+    util.timeout(when, () => certUpdateForever(secopts, s, n));
     return false;
   }
 
@@ -713,11 +701,11 @@ function trapSecureServerEvents(id, s) {
     });
   });
 
-  const rottm = util.repeat(86400000 * 7, () => rotateTkt(s)); // 7d
+  const rottm = util.repeat(86400000 * 7, () => rotateTkt(id, s)); // 7d
   s.on("close", () => clearInterval(rottm));
 
   s.on("error", (err) => {
-    log.e("tls: stop! server error; " + err.message, err);
+    log.e("tls: stop!", id, "server err; " + err.message, err);
     stopAfter(0);
   });
 
@@ -757,30 +745,32 @@ function trapSecureServerEvents(id, s) {
 }
 
 /**
+ * Rotates TLS session tickets.
+ * @param {string} id
  * @param {tls.Server?} s
  * @returns {void}
  */
-function rotateTkt(s) {
+function rotateTkt(id, s) {
+  if (envutil.isCleartext()) return; // tls offload
   if (envutil.isBun()) return;
   if (!s || !s.listening) return;
 
   let seed = bufutil.fromB64(envutil.secretb64());
   if (bufutil.emptyBuf(seed)) {
-    seed = envutil.tlsKey();
+    // see: node/config.js:setTlsVars
+    seed = bufutil.fromB64(envutil.tlsKey());
   }
   const d = new Date();
   const cur = d.getUTCFullYear() + " " + d.getUTCMonth(); // 2023 7
-  const ctx = cur + envutil.imageRef();
-
-  log.i("tls: rotating tickets; seed", bufutil.hex(seed), "ctx", ctx);
-  psk.newSession(seed, ctx);
-
+  const ctx = cur + envutil.imageRef(); // may be empty str
   // tls session resumption with tickets (or ids) reduce the 3.5kb to 6.5kb
   // overhead associated with tls handshake: netsekure.org/2010/03/tls-overhead
   nodecrypto
     .tkt48(seed, ctx)
     .then((k) => s.setTicketKeys(k)) // not supported on bun
-    .catch((err) => log.e("tls: ticket rotation failed:", err));
+    .catch((err) => log.e("tls:", id, "tkt rotation err", err));
+
+  log.i("tls:", id, "tkt rotation", bufutil.len(seed), "ctx", ctx);
 }
 
 function down(addr) {

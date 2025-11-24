@@ -18,8 +18,11 @@ Server-side processing takes from 0 milliseconds (ms) to 2ms (median), and end-t
 [<img src="https://raw.githubusercontent.com/fossunited/Branding/main/asset/FOSS%20United%20Logo/Extra/Extra%20Logo%20white%20on%20black.jpg"
      alt="FOSS United"
      height="40">](https://fossunited.org/grants)&emsp;
+[<img src="https://floss.fund/static/badge.svg"
+    alt="FLOSS/fund badge"
+    height="40">](https://floss.fund)
 
-The *Rethink DNS* resolver on Fly.io is sponsored by [FOSS United](https://fossunited.org/grants).
+The *Rethink DNS* resolver on Fly.io is sponsored by [FLOSS/fund](https://floss.fund) and FOSS United.
 
 ### Self-host
 
@@ -45,7 +48,8 @@ For help or assistance, feel free to [open an issue](https://github.com/celzero/
 ---
 
 ### Development
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/serverless-dns/serverless-dns/badge)](https://securityscorecards.dev/viewer/?uri=github.com/serverless-dns/serverless-dns)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/serverless-dns/serverless-dns/badge)](https://securityscorecards.dev/viewer/?uri=github.com/serverless-dns/serverless-dns)&emsp;
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/serverless-dns/serverless-dns)
 
 #### Setup
 
@@ -140,7 +144,7 @@ For Fastly Compute@Edge, setup env vars in [`fastly.toml`](fastly.toml), instead
 serverless-dns supports authentication with an *alpha-numeric* bearer token for both DoH and DoT. For a token, `msg-key` (secret), append the output of `hex(hmac-sha256(msg-key|domain.tld), msg)` to `ACCESS_KEYS` env var in csv format. Note: `msg` is currently fixed to `sdns-public-auth-info`.
 
 1. DoH: place the `msg-key` at the end of the blockstamp, like so:
-`1:1:4AIggAABEGAgAA:<msg-key>` (here, `1` is the version, `1:4AIggAABEGAgAA`
+`1:4AIggAABEGAgAA:<msg-key>` (here, `1` is the version, `1:4AIggAABEGAgAA`
 is the blockstamp, `<msg-key>` is the auth secret, and `:` is the delimiter).
 2. DoT: place the `msg-key` at the end of the SNI (domain-name) containing the blockstamp:
 `1-4abcbaaaaeigaiaa-<msg-key>` (here `1` is the version, `4abcbaaaaeigaiaa`
@@ -155,6 +159,29 @@ domain="my-serverless-dns-domain.tld"
 curl 'https://max.rethinkdns.com/genaccesskey?key='"$msgkey"'&dom='"$domain"
 # output
 # {"accesskey":["my-serverless-dns-domain.tld|deadbeefd3adb33fa2bb33fd3eadf084beef3b152beefdead49bbb2b33fdead83d3adbeefdeadb33f"],"context":"sdns-public-auth-info"}
+```
+
+#### TLS PSK
+
+serverless-dns also support TLS PSK ciphersuites when env var `TLS_PSK` is set to hex or base64 of randomly generated 64 bytes. Works only on cloud deployments that terminate their own TLS (like on Fly.io).
+
+The server-hint sent to the TLS 1.2 clients is fixed to [`888811119999`](https://github.com/serverless-dns/serverless-dns/blob/42a880666e/src/core/psk.js#L11).
+
+*Static PSK*: TLS 1.2 clients must set client-hint as hex string from [`790bb453...ffae2452`](https://github.com/serverless-dns/serverless-dns/blob/42a880666e/src/core/psk.js#L14-L20). The static pre-shared key is then derived from `hkdf(key, id)` where `key` is itself `hkdf(seed, ctx, salt)`:
+- `seed` is env var `TLS_PSK` converted to bytes from base64 or hex.
+- `ctx` is [UTF-8 encoding](https://github.com/serverless-dns/serverless-dns/blob/42a880666e/src/core/psk.js#L21-L27) of string `pskkeyfixedderivationcontext`.
+- `salt` is fixed from [`44f402e7...91a6e3ce`](https://github.com/serverless-dns/serverless-dns/blob/42a880666e/src/core/psk.js#L21-L27) converted to bytes.
+- `id` is the static client-hint from above (`790bb453...ffae2452`) converted to bytes.
+
+*Dynamic PSK*: To dynamically generate PSK identity and key (derived from env var `TLS_PSK`), invoke `<my-domain.tld>/gentlspsk`. The returned credentials are valid as long as `TLS_PSK` is unchanged:
+
+```js
+{
+    // 64 hex chars; id is to be used as-is as the psk client identity.
+    "id":"43dc2df4...6d332545",
+    // 128 hex chars; convert to 64-length byte array to use as psk shared secret.
+    "psk":"ebc9ab07...03629dd4"
+}
 ```
 
 #### Logs and Analytics
@@ -222,6 +249,10 @@ _base64_ encoded in env var `TLS_CERTKEY` ([ref](https://github.com/serverless-d
 TLS_OFFLOAD="true"
 # OR: base64 representation of both key (private) and cert (public chain)
 TLS_CERTKEY="KEY=b64_key_content\nCRT=b64_cert_content"
+# OPTIONALLY: use TLS with PSK ciphers (also permits domain fronting)
+TLS_PSK="hex-or-base64(cryptographically-secure-random-64bytes)"
+# OPTIONALLY: set TLS_ALLOW_ANY_SNI to true to permit domain fronting
+TLS_ALLOW_ANY_SNI="true"
 ```
 
 For Deno, `key` and `cert` files are read from paths defined in env vars, `TLS_KEY_PATH` and `TLS_CRT_PATH` ([ref](https://github.com/serverless-dns/serverless-dns/blob/270d1a3c/src/server-deno.ts#L32-L35)).
@@ -275,13 +306,13 @@ Ref: _[github/workflows](.github/workflows)_.
 
 ### Blocklists
 
-190+ blocklists are compressed in a _Succinct Radix Trie_ ([based on Steve Hanov's impl](https://stevehanov.ca/blog/?id=120)) with modifications
+200+ blocklists are compressed in a _Succinct Radix Trie_ ([based on Steve Hanov's impl](https://stevehanov.ca/blog/?id=120)) with modifications
 to speed up string search ([`lookup`](https://github.com/serverless-dns/trie/blob/965007a5c/src/ftrie.js#L378-L484)) at the expense of "succintness". The blocklists are versioned
 with unix timestamp (defined in `src/basicconfig.json` downloaded by [`pre.sh`](src/build/pre.sh)), which is generated once every week, but we'd like to generate 'em daily / hourly,
 if possible [see](https://github.com/serverless-dns/blocklists/issues/19)), and hosted on Cloudflare R2 (env var: `CF_BLOCKLIST_URL`).
 
-`serverless-dns` downloads [3 blocklist files](https://github.com/serverless-dns/serverless-dns/blob/15f62846/src/core/node/blocklists.js#L14-L16)
+`serverless-dns` downloads [blocklist files](https://github.com/serverless-dns/serverless-dns/blob/15f62846/src/core/node/blocklists.js#L14-L16)
 required to setup the radix-trie during runtime bring-up or, downloads them [lazily](https://github.com/serverless-dns/serverless-dns/blob/02f9e5bf/src/plugins/dns-op/resolver.js#L167),
 when serving a DNS request.
 
-`serverless-dns` compiles around ~13M entries (as of Jan 2023) from around 190+ blocklists. These are defined in the [serverless-dns/blocklists](https://github.com/serverless-dns/blocklists) repository.
+`serverless-dns` compiles around ~17M entries (as of Nov 2025) from around 200+ blocklists. These are defined in the [serverless-dns/blocklists](https://github.com/serverless-dns/blocklists) repository.
