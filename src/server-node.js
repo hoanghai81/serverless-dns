@@ -28,7 +28,7 @@ import * as dnsutil from "./commons/dnsutil.js";
 import * as envutil from "./commons/envutil.js";
 import * as util from "./commons/util.js";
 import { handleRequest } from "./core/doh.js";
-import { loggerWithTags } from "./core/log.js";
+import { log as log2, loggerWithTags } from "./core/log.js";
 import { setTlsVars } from "./core/node/config.js";
 import * as nodeutil from "./core/node/util.js";
 import * as psk from "./core/psk.js";
@@ -257,7 +257,7 @@ function systemDown() {
   // system-down even may arrive even before the process has had the chance
   // to start, in which case globals like env and log may not be available
   const upmins = (uptime() / 60000) | 0;
-  console.warn("W rcv stop; uptime", upmins, "mins", stats.str());
+  log2.w("W rcv stop; uptime", upmins, "mins", stats.str());
 
   const shutdownTimeoutMs = envutil.shutdownTimeoutMs();
   // servers will start rejecting conns when tracker is empty
@@ -274,7 +274,7 @@ function systemDown() {
   // TODO: handle proxy protocol sockets
   for (const m of cmap) {
     if (!m) continue;
-    console.warn("W closing...", m.size, "connections");
+    log2.w("W closing...", m.size, "connections");
     for (const v of m.values()) {
       close(v.socket);
     }
@@ -285,7 +285,7 @@ function systemDown() {
   for (const s of srvs) {
     if (!s || !s.listening) continue;
     const saddr = s.address();
-    console.warn("W stopping...", saddr);
+    log2.w("W stopping...", saddr);
     s.close(() => down(saddr));
     s.unref();
   }
@@ -308,7 +308,7 @@ function systemUp() {
   const ioTimeoutMs = envutil.ioTimeoutMs();
   const supportsHttp2 = envutil.isNode() || envutil.isDeno();
   const isBun = envutil.isBun();
-  const allowTlsPsk = envutil.allowTlsPsk();
+  let allowTlsPsk = envutil.allowTlsPsk();
 
   if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
@@ -352,28 +352,32 @@ function systemUp() {
     .filter((c) => !c.startsWith("!PSK"))
     .join(":");
   // aes128 is a 'cipher string' for tls1.2 and below
+  // nodejs.org/api/tls.html#modifying-the-default-tls-cipher-suite
   // docs.openssl.org/1.1.1/man1/ciphers/#cipher-strings
   let preferAes128 =
     "TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256:TLS_AES_128_GCM_SHA256:AES128";
   if (allowTlsPsk) {
-    preferAes128 = preferAes128 + ":aPSK";
-  } else {
-    preferAes128 = preferAes128 + ":!PSK";
+    preferAes128 = preferAes128 + ":aPSK" + ":" + defaultTlsCiphers;
+  } else if (!isBun) {
+    preferAes128 = preferAes128 + ":" + defaultTlsCiphers + ":!PSK";
   }
-  log.d(preferAes128 + ":" + defaultTlsCiphers);
+  log.d(preferAes128);
   // nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
   /** @type {tls.TlsOptions} */
   const tlsOpts = {
-    // nodejs.org/api/tls.html#modifying-the-default-tls-cipher-suite
-    ciphers: preferAes128 + ":" + defaultTlsCiphers,
+    // github.com/oven-sh/bun/issues/18865
+    ciphers: isBun ? undefined : preferAes128,
     honorCipherOrder: true,
     handshakeTimeout: Math.max((ioTimeoutMs / 2) | 0, 3 * 1000), // 3s in ms
     // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
     sessionTimeout: 60 * 60 * 24 * 7, // 7d in secs
   };
+  // Node does not support PSK importers (TLS 0 RTT)
+  // timtaubert.de/blog/2015/11/more-privacy-less-latency-improved-handshakes-in-tls-13
   if (allowTlsPsk) {
     // tlsOpts.enableTrace = true;
     /**
+     * timtaubert.de/blog/2017/02/the-future-of-session-resumption
      * @param {TLSSocket} _socket - TLS Socket
      * @param {string} idhex - Identifier in hex
      * @returns {DataView}
@@ -387,7 +391,7 @@ function systemUp() {
       /** @type {psk.PskCred?} */
       const creds = psk.recentPskCreds.get(idhex);
       if (creds && creds.ok()) {
-        // log.d("TLS PSK: known client", creds.idhexhint);
+        // log.d("TLS1.2 PSK: known client", creds.idhexhint);
         if (idhex === creds.idhex) stats.tlspsks += 1;
         else stats.tlspskd += 1;
         // TODO: confirm creds.key is compatible with socket.getCipher();
@@ -399,12 +403,12 @@ function systemUp() {
       // hopefully, the next time this same idhex connects, we'll have
       // generated the corresponding PSK credentials to serve it.
       psk.generateTlsPsk(bufutil.hex2buf(idhex));
-      // log.d("TLS PSK: unknown client id", idhex);
+      // log.d("TLS1.2 PSK: unknown client id", idhex);
       stats.tlspskmiss += 1;
       return null;
     };
     tlsOpts.pskIdentityHint = psk.serverid;
-    log.i("TLS PSK identity hint", tlsOpts.pskIdentityHint);
+    log.i("TLS1.2 PSK identity hint", tlsOpts.pskIdentityHint);
   }
   // nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
   const h2Opts = {
@@ -489,10 +493,10 @@ function systemUp() {
         .listen(dohOpts, () => {
           up("DoH1", doh.address());
           certUpdateForever(secOpts, doh);
-          trapSecureServerEvents("doh1", doh);
+          trapSecureServerEvents("dohb1", doh);
         });
     } else {
-      console.log("unsupported runtime for doh");
+      log2.i("unsupported runtime for doh");
     }
   }
 
@@ -512,7 +516,7 @@ function systemUp() {
  */
 async function certUpdateForever(secopts, s, n = 0) {
   if (n > maxCertUpdateAttempts) {
-    console.error("crt: max update attempts reached", n);
+    log2.e("crt: max update attempts reached", n);
     return false;
   }
 
@@ -531,7 +535,7 @@ async function certUpdateForever(secopts, s, n = 0) {
   const oneDayMs = 24 * 60 * 60 * 1000; // in ms
   const validUntil = new Date(crt.validTo).getTime() - Date.now();
   if (validUntil > oneDayMs) {
-    console.log("crt: #", n, "update: valid for", validUntil, "ms; not needed");
+    log2.i("crt: #", n, "update: valid for", validUntil, "ms; not needed");
     util.timeout(validUntil - oneDayMs, () => certUpdateForever(secopts, s));
     return false;
   }
@@ -546,7 +550,7 @@ async function certUpdateForever(secopts, s, n = 0) {
     if (validUntil > oneMinMs && when > validUntil) {
       when = Math.max(oneMinMs, validUntil - oneMinMs);
     }
-    console.error("crt: #", n, "update: no key/cert fetched; next", when);
+    log2.e("crt: #", n, "update: no key/cert fetched; next", when);
     util.timeout(when, () => certUpdateForever(secopts, s, n));
     return false;
   }
@@ -562,7 +566,7 @@ async function certUpdateForever(secopts, s, n = 0) {
 
   s.setSecureContext(secopts);
 
-  console.info("crt: #", n, "update: set new cert");
+  log2.i("crt: #", n, "update: set new cert");
   util.next(() => certUpdateForever(secopts, s));
 
   return true;
@@ -575,7 +579,7 @@ function logCertInfo(crt) {
   if (!crt) {
     return;
   }
-  console.info(
+  log2.i(
     crt.serialNumber, // AF163398B8095EA6D273CC9B50E95DC3
     crt.issuer, // C=AT, O=ZeroSSL, CN=ZeroSSL ECC Domain Secure Site CA
     crt.subject, // CN=max.rethinkdns.com
@@ -709,6 +713,8 @@ function trapSecureServerEvents(id, s) {
     stopAfter(0);
   });
 
+  // timtaubert.de/blog/2017/02/the-future-of-session-resumption
+  // timtaubert.de/blog/2015/11/more-privacy-less-latency-improved-handshakes-in-tls-13
   // bajtos.net/posts/2013-08-07-improve-the-performance-of-the-node-js-https-server
   // session tickets take precedence over session ids; -no_ticket is needed
   // openssl s_client -connect :10000 -reconnect -tls1_2 -no_ticket
@@ -774,7 +780,7 @@ function rotateTkt(id, s) {
 }
 
 function down(addr) {
-  console.warn(`W closed: [${addr.address}]:${addr.port}`);
+  log2.w(`W closed: [${addr.address}]:${addr.port}`);
 }
 
 function up(server, addr) {
@@ -1497,7 +1503,7 @@ function bye() {
   // in some cases, node stops listening but the process doesn't exit because
   // of other unreleased resources (see: svc.js#systemStop); and so exit with
   // success (exit code 0) regardless; ref: community.fly.io/t/4547/6
-  console.warn("W game over");
+  log2.w("W game over");
 
   if (envutil.isNode()) v8.writeHeapSnapshot("snap.end.heapsnapshot");
 
